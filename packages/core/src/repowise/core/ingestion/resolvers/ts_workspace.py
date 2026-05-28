@@ -25,6 +25,7 @@ flattened to the first plausible source target. Packages without an
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -305,3 +306,458 @@ def resolve_via_workspaces(module_path: str, ctx: "ResolverContext") -> str | No
         if cand is not None:
             return cand
     return None
+
+
+# ---------------------------------------------------------------------------
+# TsWorkspaceIndex — aggregated workspace view consumed by the dead-code
+# analyzer (exports-wildcard entry points), the resolver, and any future
+# pass that needs to know "what does the workspace publish?".
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TsWorkspaceIndex:
+    """Aggregated TypeScript/JavaScript workspace metadata.
+
+    ``packages`` mirrors :func:`build_workspace_info` — kept here so a
+    single object carries every workspace fact the rest of the pipeline
+    needs. ``exports_entry_paths`` is the set of repo-relative source
+    files that any workspace package's ``package.json`` ``exports`` map
+    resolves to (including wildcards expanded against ``ctx.path_set``).
+    These files are *the* public surface of the monorepo — flagging them
+    as unreachable just because nothing inside the repo imports them is
+    a false positive, since downstream consumers reach them via the
+    package boundary the analyzer can't observe.
+    """
+
+    packages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    exports_entry_paths: set[str] = field(default_factory=set)
+
+
+def _expand_exports_wildcard(
+    target: str, exports_pattern: str, pkg_dir: str, path_set: set[str]
+) -> set[str]:
+    """Return every concrete source file matching a wildcard exports target.
+
+    ``exports_pattern`` is the key like ``"./locales/*"``; ``target`` is
+    the right-hand side like ``"./src/locales/*.ts"``. The function
+    interprets ``*`` as ``[^/]*`` (single path segment, Node spec) and
+    enumerates ``path_set`` entries under ``pkg_dir`` that match the
+    expanded prefix/suffix.
+    """
+    if "*" not in target:
+        # Non-wildcard target — just probe the concrete path.
+        stripped = target.lstrip("./")
+        resolved = _probe_path(f"{pkg_dir}/{stripped}", path_set)
+        return {resolved} if resolved is not None else set()
+    # Decompose ``./src/locales/*.ts`` into prefix=``src/locales/`` and
+    # suffix=``.ts``. The Node spec only allows one ``*`` per pattern.
+    stripped = target.lstrip("./")
+    prefix, _, suffix = stripped.partition("*")
+    base_prefix = f"{pkg_dir}/{prefix}"
+    matches: set[str] = set()
+    for candidate in path_set:
+        if not candidate.startswith(base_prefix):
+            continue
+        if suffix and not candidate.endswith(suffix):
+            continue
+        # Reject paths whose captured segment crosses a directory boundary
+        # unless the pattern itself spans dirs (``**`` is not part of the
+        # spec; ``*`` matches a single segment).
+        captured = candidate[len(base_prefix) : len(candidate) - len(suffix) if suffix else len(candidate)]
+        if "/" in captured and exports_pattern.endswith("/*"):
+            continue
+        matches.add(candidate)
+    return matches
+
+
+def build_ts_workspace_index(ctx: "ResolverContext") -> TsWorkspaceIndex:
+    """Build the workspace index for *ctx*.
+
+    Idempotent — safe to call multiple times. Reads the workspace
+    metadata via :func:`build_workspace_info` and resolves every
+    ``exports`` target (concrete and wildcard) against ``ctx.path_set``
+    so a file's reachability through the package boundary is observable
+    to downstream passes.
+    """
+    packages = get_or_build_workspace_info(ctx)
+    entries: set[str] = set()
+    path_set = ctx.path_set
+    for _name, pkg in packages.items():
+        dir_posix: str = pkg["dir"]
+        exports_map: dict[str, str] = pkg.get("exports") or {}
+        for pattern, target in exports_map.items():
+            entries.update(_expand_exports_wildcard(target, pattern, dir_posix, path_set))
+        # ``main``/``module`` shorthand — package's primary entry.
+        main = pkg.get("main")
+        if isinstance(main, str):
+            resolved = _probe_path(f"{dir_posix}/{main.lstrip('./')}", path_set)
+            if resolved is not None:
+                entries.add(resolved)
+    return TsWorkspaceIndex(packages=packages, exports_entry_paths=entries)
+
+
+def get_or_build_ts_index(ctx: "ResolverContext") -> TsWorkspaceIndex:
+    """Memoized accessor — builds the index once per resolver context."""
+    cached = getattr(ctx, "_ts_workspace_index", None)
+    if cached is not None:
+        return cached
+    index = build_ts_workspace_index(ctx)
+    ctx._ts_workspace_index = index  # type: ignore[attr-defined]
+    return index
+
+
+# ---------------------------------------------------------------------------
+# MDX import scan + vitest config scan — entry-point sources the static
+# graph never observes through the TS/JS parser path.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_MDX_IMPORT_RE = _re.compile(
+    r"""import\s+
+        (?:type\s+)?
+        (?:\{[^}]*\}|\*\s+as\s+\w+|\w+(?:\s*,\s*\{[^}]*\})?)
+        \s+from\s+['"]([^'"]+)['"]""",
+    _re.VERBOSE,
+)
+
+_VITEST_INCLUDE_RE = _re.compile(
+    r"""include\s*:\s*\[\s*((?:['"][^'"]+['"]\s*,?\s*)+)\]""",
+    _re.MULTILINE,
+)
+_VITEST_STRING_RE = _re.compile(r"""['"]([^'"]+)['"]""")
+
+
+def find_mdx_import_targets(ctx: "ResolverContext") -> set[str]:
+    """Return repo-relative paths reached only via ``import`` in MDX/MD files.
+
+    React-component libraries published as documentation (``.mdx`` files
+    that embed live TSX components) hide their consumers from the static
+    TS parser because nothing in this repo parses MDX. The regex below
+    is intentionally narrow: ``import … from '...'``. Anything fancier
+    (JSX-in-MDX components, MDX-specific shorthand) falls out and gets
+    treated as no-edge — better than a parser dependency.
+    """
+    if ctx.repo_path is None:
+        return set()
+    from .typescript import resolve_ts_js_import
+
+    targets: set[str] = set()
+    for mdx in ctx.repo_path.rglob("*.mdx"):
+        try:
+            text = mdx.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        try:
+            rel = mdx.relative_to(ctx.repo_path).as_posix()
+        except ValueError:
+            continue
+        for match in _MDX_IMPORT_RE.finditer(text):
+            spec = match.group(1)
+            # Pre-normalise relative specifiers so ``../foo`` resolves
+            # against ``ctx.path_set`` — the underlying TS resolver
+            # leaves ``..`` segments unflattened and relies on the
+            # parser layer to do this, which doesn't run for MDX.
+            if spec.startswith("."):
+                import os as _os
+                joined = _os.path.normpath(_os.path.join(_os.path.dirname(rel), spec))
+                joined = joined.replace("\\", "/")
+                # Re-express as a relative spec rooted at the repo so
+                # ``resolve_ts_js_import`` treats it as relative.
+                spec_for_resolve = "./" + joined
+                resolved = resolve_ts_js_import(spec_for_resolve, "_root_.mdx", ctx)
+            else:
+                resolved = resolve_ts_js_import(spec, rel, ctx)
+            if resolved is None:
+                continue
+            if resolved.startswith("external:"):
+                continue
+            targets.add(resolved)
+    return targets
+
+
+def _vitest_glob_to_regex(glob: str) -> _re.Pattern[str]:
+    """Translate a vitest/minimatch glob into a regex matching repo paths.
+
+    ``**`` matches zero-or-more path segments (including empty); a single
+    ``*`` matches one path segment (no ``/``); ``?`` matches a single
+    non-``/`` char. Anything else is escaped. Python's ``fnmatch`` treats
+    ``*`` as "any chars including ``/``", which collapses ``foo/**/x``
+    into a too-strict regex that misses ``foo/x`` — hence this
+    bespoke translator.
+    """
+    out: list[str] = ["^"]
+    i = 0
+    while i < len(glob):
+        c = glob[i]
+        if c == "*":
+            if i + 1 < len(glob) and glob[i + 1] == "*":
+                # ``**`` — zero or more path segments. Consume optional
+                # trailing ``/`` so ``foo/**/bar`` matches ``foo/bar``.
+                i += 2
+                if i < len(glob) and glob[i] == "/":
+                    out.append("(?:.*/)?")
+                    i += 1
+                else:
+                    out.append(".*")
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c in ".+()|^$[]{}\\":
+            out.append("\\" + c)
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    out.append("$")
+    return _re.compile("".join(out))
+
+
+def find_vitest_include_targets(ctx: "ResolverContext") -> set[str]:
+    """Return repo-relative source files matching vitest ``include`` globs.
+
+    Belt-and-suspenders alongside the ``*.test.*`` never-flag pattern —
+    catches custom test layouts like ``runtime-tests/**`` that escape
+    the filename convention.
+    """
+    if ctx.repo_path is None:
+        return set()
+
+    targets: set[str] = set()
+    config_globs = ("vitest.config.ts", "vitest.config.js", "vitest.config.mts",
+                    "vitest.config.mjs", "vitest.config.cjs", "vitest.config.cts",
+                    "vite.config.ts", "vite.config.js", "vite.config.mts",
+                    "vite.config.mjs")
+    seen: set[Path] = set()
+    for pattern in config_globs:
+        for cfg in ctx.repo_path.rglob(pattern):
+            if cfg in seen:
+                continue
+            seen.add(cfg)
+            try:
+                text = cfg.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            cfg_dir = cfg.parent
+            for inc_match in _VITEST_INCLUDE_RE.finditer(text):
+                for str_match in _VITEST_STRING_RE.finditer(inc_match.group(1)):
+                    glob_pat = str_match.group(1)
+                    # Resolve glob relative to the config file's directory.
+                    base = (cfg_dir / glob_pat).as_posix()
+                    try:
+                        rel_glob = Path(base).relative_to(ctx.repo_path).as_posix()
+                    except ValueError:
+                        continue
+                    regex = _vitest_glob_to_regex(rel_glob)
+                    for candidate in ctx.path_set:
+                        if regex.match(candidate):
+                            targets.add(candidate)
+    return targets
+
+
+# ---------------------------------------------------------------------------
+# npm-script entry detection
+# ---------------------------------------------------------------------------
+
+# Source-file extensions a script might point at directly. Includes the
+# ``.mts``/``.cts`` family because hono/zod benchmarks favour them.
+_NPM_SCRIPT_SOURCE_EXTS: tuple[str, ...] = (
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
+)
+
+# Runner tokens that take a single source path as their first non-flag
+# positional. Detection is positional rather than name-based so we don't
+# have to track shell-syntax quirks (``--`` separators, env-var prefixes,
+# multi-command ``&&`` chains).
+_NPM_SCRIPT_RUNNERS: frozenset[str] = frozenset({
+    "tsx", "ts-node", "ts-node-esm", "vite-node", "swc-node",
+    "node", "deno", "bun",
+    "esbuild", "rollup", "vite", "webpack",
+})
+
+# Sub-package names that conventionally hold ad-hoc / experimental
+# scripts — bench harnesses, tree-shaking experiments, examples, demos.
+# Their source files are typically passed as CLI arguments at runtime
+# (``rollup -c --input X.ts``, ``tsx index.ts <file>``) rather than
+# imported by anything in the static graph. Treating them as entry
+# points matches how a human reads the repo: maintained code, not dead.
+_EXPERIMENT_DIR_NAMES: frozenset[str] = frozenset({
+    "bench", "benches", "benchmark", "benchmarks",
+    "treeshake", "treeshaking",
+    "example", "examples",
+    "demo", "demos",
+    "sample", "samples",
+    "playground", "playgrounds",
+    "scratch",
+    # ``scripts/`` is conventionally ad-hoc tooling invoked via npm
+    # commands or pre/post-commit hooks — never imported by application
+    # code, but always maintained. Treat the whole dir as live.
+    "scripts",
+})
+
+
+def _iter_script_tokens(script: str) -> list[str]:
+    """Split a script command on whitespace and shell separators.
+
+    Strips quotes off individual tokens but does NOT honour shell quoting
+    (``"a b"`` becomes two tokens) — matches Node's npm script semantics
+    where commands are passed to ``sh -c`` and we only care about token
+    *shape*, not faithful argv reconstruction.
+    """
+    # Replace shell chain operators with spaces so each chunk parses.
+    cleaned = _re.sub(r"&&|\|\||;|\|", " ", script)
+    return [tok.strip("'\"") for tok in cleaned.split() if tok.strip("'\"")]
+
+
+def find_npm_script_entry_targets(ctx: "ResolverContext") -> set[str]:
+    """Return repo-relative source files referenced by ``package.json`` scripts.
+
+    Hono's ``benchmarks/{jsx,routers,query-param}/**`` and zod's
+    ``packages/{bench,treeshake,tsc}/**`` are invoked as ``tsx <path>`` /
+    ``bun run <path>`` / ``rollup -c <path>`` from their package's
+    ``scripts.*`` — never imported by the main entry graph, so they read
+    as ``in_degree==0`` despite being live, maintained code. This scan
+    surfaces those paths as entry points.
+
+    Also picks up quoted glob arguments (prettier / eslint / format-check
+    style ``"src/**/*.ts"``) so files only ever consumed by build tooling
+    aren't flagged dead — they're maintained code, just not application
+    code.
+    """
+    if ctx.repo_path is None:
+        return set()
+
+    repo_root = ctx.repo_path.resolve()
+    path_set = ctx.path_set
+    targets: set[str] = set()
+
+    # Build a quick "directory → files under it" index lazily by scanning
+    # ``path_set`` once. Cheap: a few thousand strings at most.
+    dirs_in_repo: dict[str, list[str]] = {}
+    for p in path_set:
+        idx = 0
+        while True:
+            slash = p.find("/", idx)
+            if slash == -1:
+                break
+            dirs_in_repo.setdefault(p[:slash], []).append(p)
+            idx = slash + 1
+
+    for pkg_file in repo_root.rglob("package.json"):
+        # Skip node_modules — those are dependency manifests, not ours.
+        if "node_modules" in pkg_file.parts:
+            continue
+        try:
+            data = json.loads(pkg_file.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        scripts = data.get("scripts") or {}
+        if not isinstance(scripts, dict):
+            continue
+        pkg_dir = pkg_file.parent
+        try:
+            pkg_rel = pkg_dir.relative_to(repo_root).as_posix()
+        except ValueError:
+            continue
+        pkg_prefix = "" if pkg_rel in ("", ".") else f"{pkg_rel}/"
+
+        # Experimental sub-package convention: ``packages/bench``,
+        # ``packages/treeshake``, ``examples/`` style directories invoke
+        # their source files via runtime-supplied CLI arguments
+        # (``rollup --input``, ``import.meta.resolve``) that no static
+        # scan can resolve. The presence of an ``experimental`` directory
+        # name + a ``package.json`` is the human-meaningful "this is a
+        # maintained script bag" signal — mark every source file under
+        # it as an entry. Honour ``"private": true`` *or* the directory
+        # name match; the conventional names are the load-bearing signal.
+        pkg_dir_name = pkg_dir.name.lower()
+        if pkg_dir_name in _EXPERIMENT_DIR_NAMES:
+            dir_files = dirs_in_repo.get(pkg_rel) if pkg_rel else None
+            if dir_files:
+                for f in dir_files:
+                    if any(f.lower().endswith(ext) for ext in _NPM_SCRIPT_SOURCE_EXTS):
+                        targets.add(f)
+
+        for command in scripts.values():
+            if not isinstance(command, str):
+                continue
+            tokens = _iter_script_tokens(command)
+            for token in tokens:
+                if not token or token.startswith("-"):
+                    continue
+                # Source file with a known extension — try resolving as a
+                # path relative to the package directory. Glob meta-chars
+                # are handled by the next branch.
+                lower = token.lower()
+                if (
+                    any(lower.endswith(ext) for ext in _NPM_SCRIPT_SOURCE_EXTS)
+                    and "*" not in token
+                    and "?" not in token
+                ):
+                    candidate = (pkg_prefix + token).lstrip("./")
+                    candidate = _re.sub(r"\\", "/", candidate)
+                    # Normalise ``a/./b`` and ``a/../b`` segments.
+                    parts: list[str] = []
+                    for seg in candidate.split("/"):
+                        if seg in ("", "."):
+                            continue
+                        if seg == "..":
+                            if parts:
+                                parts.pop()
+                            continue
+                        parts.append(seg)
+                    norm = "/".join(parts)
+                    if norm in path_set:
+                        targets.add(norm)
+                    continue
+                # Glob argument (prettier / eslint / format scope) — only
+                # expand when the token has a glob meta-character and
+                # contains a slash, so plain runner names like ``tsc`` and
+                # plain flags don't get misinterpreted.
+                if ("*" in token or "?" in token) and "/" in token:
+                    rel_glob = (pkg_prefix + token).lstrip("./")
+                    # Strip stray leading ``./`` left over from npm conv.
+                    if rel_glob.startswith("./"):
+                        rel_glob = rel_glob[2:]
+                    try:
+                        regex = _vitest_glob_to_regex(rel_glob)
+                    except _re.error:
+                        continue
+                    for candidate in path_set:
+                        if regex.match(candidate):
+                            targets.add(candidate)
+                    continue
+                # Bare directory token (``eslint src runtime-tests build``)
+                # — mark every source file inside as live. Constrained to
+                # directories that actually exist in ``path_set`` to avoid
+                # treating arbitrary identifiers (``run``, ``--``) as dirs.
+                if "/" not in token and token in (
+                    "src", "lib", "app", "test", "tests", "scripts",
+                    "benchmarks", "perf-measures", "runtime-tests", "build",
+                    "examples",
+                ):
+                    dir_rel = pkg_prefix + token
+                    files = dirs_in_repo.get(dir_rel.rstrip("/"))
+                    if files:
+                        for f in files:
+                            if any(f.lower().endswith(ext) for ext in _NPM_SCRIPT_SOURCE_EXTS):
+                                targets.add(f)
+
+    # Catch experimental sub-directories nested inside a package — e.g.
+    # ``packages/tsc/bench/*.ts``, ``examples/*/index.ts`` — where the
+    # parent ``package.json`` doesn't itself match the experimental
+    # convention but a descendant directory does. We only scan dirs that
+    # already appear in ``dirs_in_repo`` (i.e., that hold source files),
+    # so the pass is bounded by what's in ``path_set``.
+    for dir_rel, files in dirs_in_repo.items():
+        last_seg = dir_rel.rsplit("/", 1)[-1].lower()
+        if last_seg not in _EXPERIMENT_DIR_NAMES:
+            continue
+        for f in files:
+            if any(f.lower().endswith(ext) for ext in _NPM_SCRIPT_SOURCE_EXTS):
+                targets.add(f)
+    return targets

@@ -165,6 +165,40 @@ _ENTRY_POINT_SYMBOL_NAMES: frozenset[str] = frozenset({
     "TEST_CLASS_CLEANUP",
     "BEGIN_TEST_METHOD_PROPERTIES",
     "END_TEST_METHOD_PROPERTIES",
+    # ---- Next.js (app + pages router) convention exports -------------
+    # Loaded by the Next.js runtime by name; never appear as user-code
+    # imports. The convention file globs already cover ``page.tsx``/
+    # ``route.ts``/``layout.tsx``, so this set only catches the long
+    # tail of route exports that escape file-glob protection (e.g.
+    # routes placed in non-standard paths). Limited to names that are
+    # distinctive enough not to risk masking dead code in unrelated
+    # files; common identifiers (``load``, ``action``, ``metadata``,
+    # ``config``, ``headers``, ``meta``, ``links``, ``runtime``) are
+    # deliberately omitted — they get file-level protection via the
+    # convention globs in :data:`_NEVER_FLAG_PATTERNS`.
+    "generateStaticParams",
+    "generateMetadata",
+    "generateViewport",
+    "generateImageMetadata",
+    "generateSitemaps",
+    "dynamicParams",
+    "fetchCache",
+    "preferredRegion",
+    "maxDuration",
+    "getStaticProps",
+    "getStaticPaths",
+    "getServerSideProps",
+    "getInitialProps",
+    "reportWebVitals",
+    # ---- Remix route module exports (distinctive names only) ---------
+    "shouldRevalidate",
+    "ErrorBoundary",
+    "CatchBoundary",
+    "HydrateFallback",
+    "clientLoader",
+    "clientAction",
+    # ---- SvelteKit page/layout module exports (distinctive names) ----
+    "trailingSlash",
 })
 from .dynamic_markers import find_dynamic_edge_files, find_dynamic_import_files
 from .models import DeadCodeFindingData, DeadCodeKind, DeadCodeReport
@@ -188,6 +222,34 @@ _BARREL_FILENAMES: frozenset[str] = frozenset({
     "index.mjs",
     "index.cjs",
 })
+
+
+def _find_jsx_namespace_files(parsed_files: dict) -> set[str]:
+    """Return repo-relative paths of TS/TSX files that declare ``namespace JSX``.
+
+    Symbols whose name is in :data:`_TS_JSX_NAMESPACE_TYPES` and whose
+    defining file lives in this set are integration points with the JSX
+    transformer — referenced implicitly by every JSX expression, never
+    imported by name. The scan is a cheap substring check; tree-sitter
+    grammar work for a richer signal would be wasted effort.
+    """
+    matches: set[str] = set()
+    for path, pf in parsed_files.items():
+        try:
+            file_info = getattr(pf, "file_info", None)
+            if file_info is None:
+                continue
+            src_path = Path(file_info.abs_path)
+            if src_path.suffix not in (".ts", ".tsx", ".d.ts"):
+                continue
+            source = src_path.read_text(errors="ignore")
+            # Match ``namespace JSX`` and ``declare namespace JSX`` — both
+            # are JSX transformer integration points in practice.
+            if "namespace JSX" in source:
+                matches.add(path)
+        except Exception:
+            continue
+    return matches
 
 
 def _is_synthetic_node(node: str) -> bool:
@@ -222,6 +284,9 @@ class DeadCodeAnalyzer:
         self._dynamic_import_files = find_dynamic_import_files(
             parsed_files or {}
         ) | find_dynamic_edge_files(graph)
+        self._jsx_namespace_files: set[str] = _find_jsx_namespace_files(
+            parsed_files or {}
+        )
         # Lazily-built ``.go`` package-directory → file-node map, used by the
         # Go package-granular reachability hook (see ``go_reachability``).
         self._go_package_files: dict[str, list[str]] | None = None
@@ -556,6 +621,22 @@ class DeadCodeAnalyzer:
                 # positives. C# auto-properties surface here as ``variable``.
                 if sym.get("kind") in _non_importable_kinds(sym.get("language", "unknown")):
                     continue
+                # Types declared inside a ``namespace JSX`` block are
+                # integration points with the JSX transformer — referenced
+                # implicitly by every JSX expression, never imported by
+                # name. The tree-sitter extractor doesn't carry namespace
+                # parentage through to ``parent_name``, so the file-level
+                # ``namespace JSX`` source-scan is the working signal we
+                # have. Names like ``IntrinsicElements`` /
+                # ``ElementChildrenAttribute`` carry the canonical TS
+                # JSX-protocol meaning; anything else inside such a file
+                # is an HTML-attribute / CSS-property shape consumed by
+                # the same machinery.
+                if (
+                    sym.get("kind") in ("interface", "type_alias")
+                    and str(node) in self._jsx_namespace_files
+                ):
+                    continue
                 if sym_name.startswith("__") and sym_name.endswith("__"):
                     continue
                 if sym_name in _ENTRY_POINT_SYMBOL_NAMES:
@@ -615,6 +696,21 @@ class DeadCodeAnalyzer:
                     continue
 
                 if self._name_matches_dynamic(sym_name, dynamic_patterns):
+                    continue
+
+                # Same-file type-position usage rescue (TS/JS): the
+                # type-ref strategy stamps ``local_type_uses`` on a file
+                # node with every type name referenced inside its own
+                # source — parameter / field / return / heritage /
+                # generic-constraint / type-alias-RHS positions. An
+                # ``interface DefaultRenderer`` consumed only as a
+                # ``type Renderer = ... : DefaultRenderer`` annotation in
+                # the same module is genuinely live; without this rescue
+                # the whole class of intra-module type protocols (Hono's
+                # ``Get``/``Set`` generics, AWS Lambda's per-adapter
+                # event-shape interfaces) reads as dead exports.
+                local_type_uses = node_data.get("local_type_uses")
+                if local_type_uses and sym_name in local_type_uses:
                     continue
 
                 is_deprecated = any(
