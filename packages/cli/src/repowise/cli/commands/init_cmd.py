@@ -185,6 +185,35 @@ _build_embedder = build_embedder
 # ---------------------------------------------------------------------------
 
 
+async def _build_resume_controller(repo_path: Path, *, resume: bool) -> tuple[Any, Any]:
+    """Create the repo row + a ResumeController bound to a fresh engine.
+
+    Returns ``(controller, engine)``. The caller runs the pipeline in the same
+    event loop and disposes the engine afterwards. The repository row is
+    created up front so the controller checkpoints against a real
+    ``Repository.id`` (not ``str(repo_path)``), and so an interrupted run
+    leaves a resumable, persisted index behind.
+    """
+    from repowise.cli.helpers import get_db_url_for_repo
+    from repowise.core.persistence import (
+        create_engine,
+        create_session_factory,
+        get_session,
+        init_db,
+        upsert_repository,
+    )
+    from repowise.core.pipeline.resume import ResumeController
+
+    engine = create_engine(get_db_url_for_repo(repo_path))
+    await init_db(engine)
+    sf = create_session_factory(engine)
+    async with get_session(sf) as session:
+        repo_id = (
+            await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+        ).id
+    return ResumeController(sf, repo_id, resume=resume), engine
+
+
 async def _persist_result(
     result: Any,
     repo_path: Path,
@@ -202,12 +231,22 @@ async def _persist_result(
         init_db,
         upsert_repository,
     )
-    from repowise.core.pipeline import persist_pipeline_result
+    from repowise.core.pipeline import (
+        persist_analysis,
+        persist_generation,
+        persist_pipeline_result,
+    )
 
     url = get_db_url_for_repo(repo_path)
     engine = create_engine(url)
     await init_db(engine)
     sf = create_session_factory(engine)
+
+    # When a ResumeController persisted the INDEX phase incrementally during
+    # the run, the graph + git + symbols are already on disk — write only the
+    # analysis + generation outputs here (avoids re-persisting a rehydrated
+    # graph and a redundant full index write).
+    index_done = bool(getattr(result, "index_persisted_incrementally", False))
 
     fts = None
     if result.generated_pages:
@@ -236,7 +275,11 @@ async def _persist_result(
                 existing = {}
             existing["tech_stack"] = result.tech_stack
             repo.settings_json = _json.dumps(existing)
-        await persist_pipeline_result(result, session, repo.id)
+        if index_done:
+            await persist_analysis(result, session, repo.id)
+            await persist_generation(result, session, repo.id)
+        else:
+            await persist_pipeline_result(result, session, repo.id)
 
         # Record a completed GenerationJob so the web UI can show
         # "last synced" / "last re-indexed" timestamps.
@@ -262,6 +305,20 @@ async def _persist_result(
     if fts is not None and result.generated_pages:
         for page in result.generated_pages:
             await fts.index(page.page_id, page.title, page.content)
+
+    # Stamp the analysis (+ generation) phases in the resume ledger now that
+    # they're persisted, so a future resume can skip them too.
+    if index_done:
+        from repowise.core.pipeline.resume import ResumeLedger, ResumePhase
+
+        async with get_session(sf) as _ls:
+            repo_id = (
+                await upsert_repository(_ls, name=result.repo_name, local_path=str(repo_path))
+            ).id
+        ledger = ResumeLedger(sf, repo_id)
+        await ledger.mark_completed(ResumePhase.ANALYSIS)
+        if result.generated_pages:
+            await ledger.mark_completed(ResumePhase.GENERATION)
 
     await engine.dispose()
 
@@ -297,7 +354,8 @@ def _run_workspace_generation(
     from repowise.cli.cost_estimator import build_generation_plan, estimate_cost
     from repowise.cli.ui import RichProgressCallback
     from repowise.core.generation import GenerationConfig
-    from repowise.core.pipeline import run_generation
+
+    from ._generation_persist import run_generation_with_persistence
 
     # Build embedder + vector store
     embedder_impl: Any = build_embedder(embedder_name_resolved)
@@ -413,8 +471,9 @@ def _run_workspace_generation(
         gen_callback = RichProgressCallback(gen_progress, console)
 
         generated_pages = run_async(
-            run_generation(
+            run_generation_with_persistence(
                 repo_path=repo_path,
+                repo_name=result.repo_name,
                 parsed_files=result.parsed_files,
                 source_map=result.source_map,
                 graph_builder=result.graph_builder,
@@ -488,6 +547,7 @@ class _WorkspaceCtx:
     resolved_reasoning: str
     embedder_name_resolved: str
     resolved_commit_limit: int
+    run_mode: str = "standard"
 
 
 @dataclass
@@ -511,6 +571,7 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
     from datetime import datetime
 
     from repowise.core.pipeline import PhaseTimingRecorder, run_pipeline
+    from repowise.core.pipeline.modes import OrchestratorMode
 
     console.print(
         f"  [{BRAND}][{idx}/{total}][/] Indexing [bold]{repo.alias}[/bold] ({repo.path.name})..."
@@ -541,6 +602,11 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
                     exclude_patterns=ctx.exclude_patterns if ctx.exclude_patterns else None,
                     include_submodules=ctx.include_submodules,
                     generate_docs=False,
+                    mode=(
+                        OrchestratorMode.FAST
+                        if ctx.run_mode == "fast"
+                        else OrchestratorMode.STANDARD
+                    ),
                     progress=callback,
                     existing_kg_fingerprint=_prev_kg_fp,
                 )
@@ -776,6 +842,7 @@ def _workspace_init(
     onboarding: bool = True,
     coverage_pct: float | None = None,
     harvest_decisions: bool = True,
+    run_mode: str = "standard",
 ) -> None:
     """Multi-repo workspace initialization.
 
@@ -928,6 +995,7 @@ def _workspace_init(
         resolved_reasoning=resolved_reasoning,
         embedder_name_resolved=embedder_name_resolved,
         resolved_commit_limit=resolved_commit_limit,
+        run_mode=run_mode,
     )
 
     for i, repo in enumerate(selected, 1):
@@ -1192,8 +1260,9 @@ def _run_generation_phase(
         embedder_impl: Any = build_embedder(embedder_name_resolved)
         vector_store: Any = build_vector_store(repo_path, embedder_impl)
 
-        # Run generation via the pipeline's generation function
-        from repowise.core.pipeline import run_generation
+        # Run generation via the pipeline's generation function, wrapped so
+        # pages are reused + flushed incrementally (resume-friendly).
+        from ._generation_persist import run_generation_with_persistence
 
         with Progress(
             SpinnerColumn(),
@@ -1217,8 +1286,9 @@ def _run_generation_phase(
             provider._cost_tracker = cost_tracker
 
             generated_pages = run_async(
-                run_generation(
+                run_generation_with_persistence(
                     repo_path=repo_path,
+                    repo_name=result.repo_name,
                     parsed_files=result.parsed_files,
                     source_map=result.source_map,
                     graph_builder=result.graph_builder,
@@ -1276,6 +1346,31 @@ def _run_generation_phase(
     return False, cost_declined
 
 
+def _git_tier_for_run_mode(run_mode: str) -> str:
+    """Map a CLI run-mode to the git index tier it persisted.
+
+    Fast mode indexes the ESSENTIAL tier (no per-file blame / co-change);
+    standard mode indexes FULL. Recorded in state.json so ``--resume`` and
+    ``repowise update`` know which tier already exists on disk.
+    """
+    return "essential" if run_mode == "fast" else "full"
+
+
+def _effective_run_mode_for_resume(repo_path: Path, run_mode: str, resume: bool) -> str:
+    """On ``--resume``, continue the git tier the prior run used.
+
+    A fast (ESSENTIAL-tier) run resumed *without* re-passing ``--mode fast``
+    would otherwise default to STANDARD and silently redo the expensive FULL
+    git indexing the first run deliberately skipped (issue #341). We restore
+    the persisted ``run_mode`` unless the user explicitly asked for fast on
+    the resume invocation (in which case fast already wins).
+    """
+    if not resume or run_mode == "fast":
+        return run_mode
+    prev = load_state(repo_path).get("run_mode")
+    return prev if prev in ("fast", "standard") else run_mode
+
+
 def _save_full_state_and_config(
     *,
     repo_path: Path,
@@ -1323,6 +1418,9 @@ def _save_full_state_and_config(
     state["provider"] = provider.provider_name
     state["model"] = provider.model_name
     state["docs_enabled"] = True
+    # Full-mode docs runs always index the FULL git tier.
+    state["run_mode"] = "standard"
+    state["git_tier"] = "full"
     total_tokens = sum(p.total_tokens for p in (result.generated_pages or []))
     state["total_tokens"] = total_tokens
     if phase_timings:
@@ -1690,6 +1788,7 @@ def init_command(
             onboarding=onboarding,
             coverage_pct=coverage_pct,
             harvest_decisions=harvest_decisions,
+            run_mode=run_mode,
         )
         return
 
@@ -1703,6 +1802,13 @@ def init_command(
 
     # Suppress library/structlog output — progress bars are the only output needed.
     setup_logging_silence()
+
+    # On --resume, continue the prior run's git tier so a resumed fast index
+    # doesn't silently fall back to the expensive FULL tier (issue #341). Done
+    # before the interactive gate so a resume never re-prompts for the mode.
+    run_mode = _effective_run_mode_for_resume(repo_path, run_mode, resume)
+    if run_mode == "fast":
+        index_only = True
 
     # ---- Interactive mode (TTY, no explicit flags) ----
     is_interactive = sys.stdin.isatty() and provider_name is None and not index_only
@@ -1896,24 +2002,53 @@ def init_command(
             _prev_state.get("knowledge_graph", {}).get("fingerprint") if not force else None
         )
 
-        result = run_async(
-            run_pipeline(
-                repo_path,
-                commit_depth=resolved_commit_limit,
-                follow_renames=resolved_follow_renames,
-                skip_tests=skip_tests,
-                skip_infra=skip_infra,
-                exclude_patterns=exclude_patterns if exclude_patterns else None,
-                include_submodules=include_submodules,
-                generate_docs=False,
-                llm_client=llm_client,
-                concurrency=concurrency,
-                test_run=test_run,
-                mode=orchestrator_mode,
-                progress=callback,
-                existing_kg_fingerprint=_prev_kg_fp,
+        async def _index_with_resume() -> Any:
+            # Create the engine, session factory, and repository row *before*
+            # the pipeline (all in this one event loop) so the resume
+            # controller has a stable Repository.id to checkpoint against —
+            # fixing the old str(repo_path) FK wiring — and so an interrupt
+            # mid-run leaves a resumable, persisted index behind. Skipped on a
+            # dry run, which must not touch the database at all.
+            controller = None
+            engine = None
+            if not dry_run:
+                controller, engine = await _build_resume_controller(repo_path, resume=resume)
+            try:
+                return await run_pipeline(
+                    repo_path,
+                    commit_depth=resolved_commit_limit,
+                    follow_renames=resolved_follow_renames,
+                    skip_tests=skip_tests,
+                    skip_infra=skip_infra,
+                    exclude_patterns=exclude_patterns if exclude_patterns else None,
+                    include_submodules=include_submodules,
+                    generate_docs=False,
+                    llm_client=llm_client,
+                    concurrency=concurrency,
+                    test_run=test_run,
+                    mode=orchestrator_mode,
+                    progress=callback,
+                    existing_kg_fingerprint=_prev_kg_fp,
+                    resume_controller=controller,
+                )
+            finally:
+                if engine is not None:
+                    await engine.dispose()
+
+        # Make the long synchronous index/analysis phases interruptible: the
+        # first Ctrl-C unwinds them cleanly (the INDEX checkpoint already on
+        # disk is reused on the next --resume), a second forces a hard quit.
+        from repowise.core.cancellation import PipelineCancelled, cancellation_scope
+
+        try:
+            with cancellation_scope():
+                result = run_async(_index_with_resume())
+        except (PipelineCancelled, KeyboardInterrupt):
+            console.print(
+                "\n[yellow]Interrupted.[/] Indexed work so far has been saved — "
+                "run [bold]repowise init --resume[/] to continue where it stopped."
             )
-        )
+            return
 
     # Surface per-phase timing data to the caller — both for the
     # state.json persistence below and for any future "profile" tooling
@@ -2010,6 +2145,10 @@ def init_command(
     base_state = load_state(repo_path)
     base_state["last_sync_commit"] = head
     base_state["docs_enabled"] = not effective_index_only and provider is not None
+    # Record the git tier this run indexed so a later --resume continues the
+    # same tier instead of silently upgrading ESSENTIAL → FULL (issue #341).
+    base_state["run_mode"] = run_mode
+    base_state["git_tier"] = _git_tier_for_run_mode(run_mode)
     if phase_timings:
         base_state["phase_timings"] = phase_timings
     kg = getattr(result, "knowledge_graph_result", None)

@@ -34,7 +34,9 @@ from .phases.analysis import (
 )
 from .phases.generation import run_generation
 from .phases.git import _run_git_indexing, drop_transient_git_signals
-from .phases.ingestion import _run_ingestion
+from .phases.ingestion import _run_ingestion, reparse_for_resume
+from .resume import ResumePhase
+from .resume.controller import ResumeController
 
 logger = structlog.get_logger(__name__)
 
@@ -128,6 +130,12 @@ class PipelineResult:
     search_codebase). None when no store was configured (semantic dedup is
     then skipped; title dedup still runs)."""
 
+    index_persisted_incrementally: bool = False
+    """True when a ResumeController persisted (or rehydrated) the INDEX phase
+    during the run. The caller's final persist then skips the index portion —
+    it is already on disk — and writes only analysis + generation. False for
+    every non-resume caller, which persist the full result as before."""
+
 
 # ---------------------------------------------------------------------------
 # Pipeline
@@ -158,6 +166,7 @@ async def run_pipeline(
     generation_config: Any | None = None,
     existing_kg_fingerprint: str | None = None,
     on_page_ready: Any | None = None,
+    resume_controller: ResumeController | None = None,
 ) -> PipelineResult:
     """Run the repowise indexing/analysis/generation pipeline.
 
@@ -263,26 +272,62 @@ async def run_pipeline(
             progress=progress,
         )
 
-    (
-        (
-            parsed_files,
-            file_infos,
-            repo_structure,
-            source_map,
-            graph_builder,
-            traversal_stats,
-            tech_items,
-        ),
-        (
-            git_summary,
-            git_metadata_list,
-            git_meta_map,
-        ),
-    ) = await asyncio.gather(_ingestion_stage(), _git_stage())
+    # Resume fast-path: when a prior run already persisted the INDEX phase
+    # (graph + git), rehydrate it from the DB and only re-parse source files —
+    # skipping the git history walk and the graph centrality kernels, which
+    # are the minutes-long work that makes a first index slow. Falls back to a
+    # full compute if rehydration yields no graph (nothing was persisted).
+    skip_index = bool(resume_controller and await resume_controller.can_skip(ResumePhase.INDEX))
+    git_summary = None
+    if skip_index:
+        try:
+            graph_builder, git_meta_map = await resume_controller.rehydrate_index(repo_path)
+            if progress:
+                progress.on_message(
+                    "info", "  ↳ Resuming — reusing persisted graph + git index"
+                )
+            (
+                parsed_files,
+                file_infos,
+                repo_structure,
+                source_map,
+                tech_items,
+            ) = await reparse_for_resume(
+                repo_path,
+                exclude_patterns=exclude_patterns,
+                include_submodules=include_submodules,
+                include_nested_repos=include_nested_repos,
+                skip_tests=skip_tests,
+                skip_infra=skip_infra,
+                progress=progress,
+            )
+            traversal_stats = None
+            git_metadata_list = list(git_meta_map.values())
+        except Exception as exc:
+            logger.warning("resume_rehydrate_failed_recomputing", error=str(exc))
+            skip_index = False
 
-    # Add co-change edges to the graph
-    if git_meta_map:
-        graph_builder.add_co_change_edges(git_meta_map)
+    if not skip_index:
+        (
+            (
+                parsed_files,
+                file_infos,
+                repo_structure,
+                source_map,
+                graph_builder,
+                traversal_stats,
+                tech_items,
+            ),
+            (
+                git_summary,
+                git_metadata_list,
+                git_meta_map,
+            ),
+        ) = await asyncio.gather(_ingestion_stage(), _git_stage())
+
+        # Add co-change edges to the graph (rehydrated graphs already carry them)
+        if git_meta_map:
+            graph_builder.add_co_change_edges(git_meta_map)
 
     # ---- External systems (C4 L1) ------------------------------------------
     # Parse repo manifests for declared third-party dependencies. Failure here
@@ -314,6 +359,19 @@ async def run_pipeline(
     except Exception as _ext_err:
         logger.warning("external_systems_extraction_failed", error=str(_ext_err))
     _phase_done(progress, "external_systems")
+
+    # ---- Checkpoint: INDEX -------------------------------------------------
+    # Persist the freshly-computed graph + git + symbols now so an interrupt
+    # during the analysis phase below can resume without redoing the expensive
+    # index. Skipped when we rehydrated (already persisted) — best-effort.
+    if resume_controller is not None and not skip_index:
+        await resume_controller.checkpoint_index(
+            parsed_files=parsed_files,
+            graph_builder=graph_builder,
+            git_metadata_list=git_metadata_list,
+            git_summary=git_summary,
+            external_systems=external_systems,
+        )
 
     # Emit rich insight summary for the ingestion phase
     if progress:
@@ -358,26 +416,60 @@ async def run_pipeline(
     if progress:
         progress.on_message("info", "Phase 2: Analysis")
 
-    dead_code_report = await _run_dead_code_analysis(graph_builder, git_meta_map, progress=progress)
-
-    health_report = await _run_health_analysis(
-        graph_builder, git_meta_map, parsed_files, repo_path=repo_path, progress=progress
+    # Resume fast-path: when a prior run already completed (and persisted) the
+    # ANALYSIS phase, skip recomputing dead code / health / decisions — the
+    # last is the costly one (LLM-backed, minutes on large repos). We rehydrate
+    # only the thin views generation reads; the persisted rows stay
+    # authoritative and are never re-written from these. ``health_report`` is
+    # not a generation input, so it stays None on this path (its persisted rows
+    # are untouched). Falls back to a full recompute if rehydration errors.
+    skip_analysis = bool(
+        resume_controller and await resume_controller.can_skip(ResumePhase.ANALYSIS)
     )
+    dead_code_report = None
+    health_report = None
+    decision_report = None
+    # Reports actually fed to generation + KG — rehydrated on the skip path,
+    # the freshly computed ones otherwise.
+    gen_dead_code_report = None
+    gen_decision_report = None
+    if skip_analysis:
+        try:
+            (
+                gen_dead_code_report,
+                gen_decision_report,
+            ) = await resume_controller.rehydrate_analysis()
+            if progress:
+                progress.on_message("info", "  ↳ Resuming — reusing persisted analysis")
+        except Exception as exc:
+            logger.warning("resume_rehydrate_analysis_failed_recomputing", error=str(exc))
+            skip_analysis = False
 
-    # Drop the in-memory-only ``BlameIndex`` now that the health biomarkers
-    # have consumed it — before it can leak into ``PipelineResult`` and the
-    # downstream JSON artifact writers / DB persistence. ``git_meta_map`` shares
-    # these dict objects, so this cleans both views.
-    drop_transient_git_signals(git_metadata_list)
+    if not skip_analysis:
+        dead_code_report = await _run_dead_code_analysis(
+            graph_builder, git_meta_map, progress=progress
+        )
 
-    decision_report = await _run_decision_extraction(
-        repo_path,
-        llm_client=llm_client,
-        graph_builder=graph_builder,
-        git_meta_map=git_meta_map,
-        parsed_files=parsed_files,
-        progress=progress,
-    )
+        health_report = await _run_health_analysis(
+            graph_builder, git_meta_map, parsed_files, repo_path=repo_path, progress=progress
+        )
+
+        # Drop the in-memory-only ``BlameIndex`` now that the health biomarkers
+        # have consumed it — before it can leak into ``PipelineResult`` and the
+        # downstream JSON artifact writers / DB persistence. ``git_meta_map``
+        # shares these dict objects, so this cleans both views.
+        drop_transient_git_signals(git_metadata_list)
+
+        decision_report = await _run_decision_extraction(
+            repo_path,
+            llm_client=llm_client,
+            graph_builder=graph_builder,
+            git_meta_map=git_meta_map,
+            parsed_files=parsed_files,
+            progress=progress,
+        )
+        gen_dead_code_report = dead_code_report
+        gen_decision_report = decision_report
 
     # ---- Knowledge Graph skeleton (deterministic, no LLM) ----------------
     knowledge_graph_result = None
@@ -421,7 +513,7 @@ async def run_pipeline(
                 tech_stack=tech_stack_dicts,
                 external_systems=external_systems,
                 git_meta_map=git_meta_map,
-                dead_code_report=dead_code_report,
+                dead_code_report=gen_dead_code_report,
                 repo_path=repo_path,
             )
             knowledge_graph_result.fingerprint = new_fingerprint
@@ -435,6 +527,19 @@ async def run_pipeline(
         _phase_done(progress, "knowledge_graph.skeleton")
     except (ValueError, KeyError, OSError, RuntimeError) as kg_err:
         logger.error("kg_skeleton_building_failed", error=str(kg_err), exc_info=True)
+
+    # ---- Checkpoint: ANALYSIS ----------------------------------------------
+    # Persist dead code + health + decisions now that the analysis phase is
+    # complete, so an interrupt during the long generation phase below can
+    # resume past analysis instead of recomputing it. Skipped when we already
+    # rehydrated analysis (it's by definition persisted) — best-effort.
+    if resume_controller is not None and not skip_analysis:
+        await resume_controller.checkpoint_analysis(
+            dead_code_report=dead_code_report,
+            health_report=health_report,
+            decision_report=decision_report,
+            git_metadata_list=git_metadata_list,
+        )
 
     # ---- Phase 3: Generation (optional) ------------------------------------
     generated_pages: list[Any] | None = None
@@ -481,8 +586,8 @@ async def run_pipeline(
             progress=progress,
             resume=resume,
             generation_config=resolved_generation_config,
-            dead_code_report=dead_code_report,
-            decision_report=decision_report,
+            dead_code_report=gen_dead_code_report,
+            decision_report=gen_decision_report,
             external_systems=external_systems,
             on_page_ready=on_page_ready,
         )
@@ -566,6 +671,9 @@ async def run_pipeline(
         ],
         external_systems=external_systems,
         vector_store=vector_store,
+        index_persisted_incrementally=(
+            resume_controller.index_persisted if resume_controller is not None else False
+        ),
     )
 
 
