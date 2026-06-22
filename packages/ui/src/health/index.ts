@@ -36,3 +36,7 @@ export * from "./hot-functions-panel";
 export * from "./hidden-coupling-list";
 export * from "./recalibration-banner";
 export * from "./defect-accuracy-card";
+export * from "./code-health-adapter";
+export * from "./triage-view";
+export * from "./coverage-view";
+export * from "./trend-view";
